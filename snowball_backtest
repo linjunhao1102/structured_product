@@ -1,0 +1,659 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import datetime
+from dateutil.relativedelta import relativedelta
+from time import sleep
+#from longbridge.openapi import QuoteContext, Config, Period, AdjustType
+import tkinter as tk
+import yfinance as yf
+from tkcalendar import DateEntry
+from scipy import stats
+from io import BytesIO
+import base64
+from PIL import Image
+
+# 获取标的行情数据
+# 仅输出日期 + close price
+def get_data(underlying_code, length='150mo'): #默认取过去150个月的数据
+
+    #长桥数据库
+    # Load configuration from environment variables
+    # config = Config.from_env()
+    # Create a context for quote APIs
+    # ctx = QuoteContext(config)
+
+    # resp = ctx.candlesticks(underlying_code, Period.Day, 1000, AdjustType.NoAdjust)
+    # print(resp)
+
+    # # only save timestamp, close price
+    # t_close = []
+    # for info in resp:
+    #     t_close.append((info.timestamp, info.close))
+
+    # underlying = pd.DataFrame(t_close, columns=['time', 'close']).set_index('time')
+    # underlying['close'] = underlying['close'].astype(float)
+    # return underlying
+
+    #因为yahoo_finance的API没有中证500，中证1000，恒生科技的数据。手动取自investing.com
+    # 中证500
+    if underlying_code == '^CSI500':
+        df = pd.read_csv(r"C:\Users\LeoLin\Desktop\myapp\indexdb\csi500.csv")
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df.sort_values('DATE', inplace=True)
+        df.set_index('DATE', inplace=True)
+
+    # 中证500
+    elif underlying_code == '^CSI1000':
+        df = pd.read_csv(r"C:\Users\LeoLin\Desktop\myapp\indexdb\csi1000.csv")
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df.sort_values('DATE', inplace=True)
+        df.set_index('DATE', inplace=True)
+    
+    # 黄金美元
+    elif underlying_code == 'XAUUSD':
+        df = pd.read_csv(r"C:\Users\LeoLin\Desktop\myapp\indexdb\XAUUSD.csv")
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df.sort_values('DATE', inplace=True)
+        df.set_index('DATE', inplace=True)
+
+    # 恒生科技
+    elif underlying_code == '^HSTECH':
+        df = pd.read_csv(r"C:\Users\LeoLin\Desktop\myapp\indexdb\hstech.csv")
+        df['DATE'] = pd.to_datetime(df['DATE'])
+        df.sort_values('DATE', inplace=True)
+        df.set_index('DATE', inplace=True)
+
+    else:
+    #yahoo数据库 -- 其他标的
+        ticker = yf.Ticker(underlying_code)
+        df = ticker.history(period=length)
+        df.index = df.index.tz_localize(None)
+        df.rename(columns={'Close':'close'}, inplace=True)
+    
+    df.rename_axis('time', inplace=True)
+    return df[['close']]
+
+# 数字票据，取结束日期
+def get_end_date(date, datelst, duration):
+    end_date = date + relativedelta(months = duration)
+    if end_date in datelst:
+        correct_date = end_date
+    else:
+        day_plus = end_date
+        for j in range(10):
+            if day_plus not in datelst:
+                day_plus = day_plus + relativedelta(days=1)
+            else:
+                break
+        correct_date = day_plus
+    return correct_date
+
+# 雪球，敲出日期筛选，每月
+def get_KO_dates(date, datelst, duration, lock):
+    result = []
+    for i in range(1,duration+1):
+        month_plus = date + relativedelta(months=i)
+        if month_plus in datelst:
+            correct_date = month_plus
+        else:
+            day_plus = month_plus
+            for j in range(10):
+                if day_plus not in datelst:
+                    day_plus = day_plus + relativedelta(days=1)
+                else:
+                    break
+            correct_date = day_plus
+        result.append(correct_date)
+    # 去掉锁定期内的 KO date
+    return result[lock:]
+    
+# 计算胜率
+def win_rate(flaglst):
+    finished_count = (flaglst.count(1) + flaglst.count(2) + flaglst.count(-1))
+    if finished_count <= 0:
+        return -1
+    else:
+        return (flaglst.count(1) + flaglst.count(2)) / finished_count
+
+# 完结率
+def finish_rate(flaglst):
+     return (len(flaglst) - flaglst.count(0)) / len(flaglst)
+
+def ko_rate(flaglst):
+    finished_count = (flaglst.count(1) + flaglst.count(2) + flaglst.count(-1))
+    return flaglst.count(2) / finished_count
+
+def win_count(flaglst):
+    return flaglst.count(1) + flaglst.count(2)
+
+# 雪球----------------------------------------------------------------------------------------------------------------------------------------
+# 雪球结构过程结果判定
+def snowball_process(underlying, start, end, KI, KO, duration, lock, stepdown, KOrange, KIrange, kolength):
+
+    latest_date = underlying.index[-1]
+    valid_dates = underlying.index.to_list()
+    KO_dates = get_KO_dates(start, valid_dates, duration, lock)
+    KO_dates = [x for x in KO_dates if x < latest_date]
+    KOwindow = underlying.loc[KO_dates]
+
+    day_plus = end
+    for j in range(10):
+        if day_plus not in valid_dates:
+            day_plus = day_plus + relativedelta(days=1)
+        else:
+            break
+
+    valid_end_date = day_plus
+    KIwindow = underlying[(underlying.index >= start) & (underlying.index <= valid_end_date)]
+
+    ini_prc = underlying.loc[start][0]
+    inprc = ini_prc * KI
+    outprc = ini_prc * KO
+    strick = ini_prc * 1.0
+    status = [(start,ini_prc,'notin')]
+    
+    
+    #print('Initial Price: ', ini_prc, 'on', str(start)[:10])
+    data_count = len(KOwindow)
+    if data_count == 0:
+        return 0
+    last_date = KOwindow.index[-1]
+    
+    # 过程判断
+    # flag:
+    # -1 -> lose
+    #  1 -> win
+    #  0 -> In Process
+    for index, row in KIwindow.iterrows():
+
+        close = row['close']
+        #print(index.date(), start.date(), end.date())
+
+        # 1. KO -> End of option 已完结&未完结，已敲出
+        if (close >= outprc) and (index in KO_dates):
+            #print('knock out option with price:', close, outprc)
+            status.append((index, close,'KO'))
+            KOrange.append((start, ini_prc))
+            kolength.append(KO_dates.index(index) + 1)
+            #print(KO_dates.index(index))
+            break
+
+        else:
+            if index in KO_dates:
+                stepdown_count = KO_dates.index(index)
+                outprc = ini_prc * (KO - (stepdown_count * stepdown)) 
+                #print('stepdown: ', stepdown_count, outprc)
+                if close >= outprc:
+                    #print('knock out after stepdown with price:', close, outprc)
+                    status.append((index, close,'KO'))
+                    KOrange.append((start, ini_prc))
+                    kolength.append(KO_dates.index(index) + 1)
+                    #print(KO_dates.index(index))
+                    break
+            # 判断是否完结
+            if data_count + lock == duration:
+                #已完结，未到期
+                if status[-1][2] == 'notin':
+                    # 2. 未敲入
+                    if close > inprc:
+                        #print('not in not out with price:', close)
+                        status.append((index, close, 'notin'))
+                    else:
+                        # 3. 敲入
+                        #print ('knock in option with price:', close)
+                        status.append((index, close, 'KI'))
+                        KIrange.append((start, ini_prc))
+                else:
+                    # 4. 未敲出，已敲入
+                    #print('remain in with price:', close, outprc)
+                    status.append((index, close, 'in'))
+                
+                # 已完结，已到期
+                if index == last_date:
+                    #print('term finished ', ini_prc, close, inprc,outprc)
+                    status.append((index, close, 'term_finished'))
+                    # print(KO_dates.index(index))
+                    #kolength.append(len(KO_dates) + 1)
+            else:
+                #未完结
+                # 未完结且未敲出所以暂时不考虑是否已敲入 -- TODO 判断未完结option状态
+                #print(close)
+                status.append((index, close, 'IP'))
+                if close < inprc and (start, ini_prc) not in KIrange:
+                    KIrange.append((start, ini_prc))
+    
+    
+    # 判断结果
+    # 敲出
+    if status[-1][2] == 'KO' or status[-2][2] == 'KO':
+        flag = 2
+        #print ('win')
+    # 未完结
+    elif status[-1][2] == 'notin':
+        flag = 1
+    elif status[-1][2] == 'IP':
+        #print('IP')
+        flag = 0
+    else:
+        # term finished while not knock in: 未敲入未敲出
+        if status[-2][2] == 'notin':
+            flag = 1
+            #print('win')
+        else:
+            # Last status is KI BUT close price >= strick price -> win
+            # 到期且敲入，终价高于行使价
+            if close >= strick:
+                flag = 1
+                #print ('win')
+
+            # Last status is KI BUT close price < strick price -> lose
+            # -> only lose case
+            # 到期且敲入，终价低于行使价
+            else:
+                flag = -1
+                #print ('lose ', strick-close)
+
+    if flag == -1:
+        return (flag, (start,1))
+    else:
+        return (flag, (start,0))
+
+
+
+# # 仅调用方法计算胜率 api
+# def snowballapi(start, end, underlying, KI, KO, duration, lock, stepdown):
+#     # start = str,'%m/%d/%y'
+#     # end = str,'%m/%d/%y'
+#     # underlying = str, bloomberg code
+#     # KI = float, x% -> x * 0.01
+#     # KO = float, x% -> x * 0.01
+#     # duration = int, in months
+
+#     test_start = datetime.strptime(start, '%m/%d/%y')
+#     test_end = datetime.strptime(end, '%m/%d/%y')
+#     try:
+#         underlying_df = get_data(underlying)
+#     except:
+#         output_label.config(text=f"Data Error")
+
+#     result = []
+#     datelst = []
+#     kolst = []
+#     kilst = []
+#     kolength = []
+#     available = underlying_df.index.to_list()
+
+#     day_plus = test_end
+#     for j in range(10):
+#         if day_plus not in available:
+#             day_plus = day_plus + relativedelta(days=1)
+#         else:
+#             break
+
+#     valid_test_end = day_plus
+
+    
+#     available = [x for x in available if x >= test_start and x < valid_test_end]
+#     for testdate in available:
+#         #if testdate >= test_start and testdate < test_end:
+#         target_start = testdate
+#         target_end = testdate + relativedelta(months=duration)
+#         resultdetail = snowball_process(underlying_df, target_start, target_end, KI, KO, duration, lock, stepdown, kolst, kilst, kolength)
+#         result.append(resultdetail[0])
+#         datelst.append(resultdetail[1])
+        
+        
+#     if result == []:
+#         raise ValueError('Data Out of Range')
+    
+#     output = '''
+#     盈利/保本数: {}.\n亏损数: {}.\n胜率: {}.\n平均敲出期限: {}.\n完结率: {}.
+#     '''.format(result.count(1), result.count(-1), round(win_rate(result),3), round(np.mean(kolength), 2), round(finish_rate(result),3),)
+#     return output
+# 雪球----------------------------------------------------------------------------------------------------------------------------------------
+
+# Digital Note----------------------------------------------------------------------------------------------------------------------------------------
+def digitalnote_process(underlying, start, end, duration, strike):
+
+    valid_dates = underlying.index.to_list()
+    day_plus = end
+    for j in range(10):
+        if day_plus not in valid_dates:
+            day_plus = day_plus + relativedelta(days=1)
+        else:
+            break
+
+    valid_end_date = day_plus
+    window = underlying[(underlying.index >= start) & (underlying.index <= valid_end_date)]
+
+    end_window_lst = []
+    for date in window.index:
+        print(date)
+        end_date = get_end_date(date, underlying.index, duration)
+        end_window_lst.append((date, underlying[underlying.index == end_date]['close'].values[0]))
+    end_window = pd.DataFrame(end_window_lst, columns=['time', 'end_close'])
+    end_window.set_index('time', inplace=True)
+
+    def verify(row):
+        if row['close'] > strike * row['end_close']:
+            return 1
+        else:
+            return 2
+    
+    merged_window = window.join(end_window)
+    merged_window['result'] = merged_window.apply(verify, axis = 1)
+    result = merged_window['result'].to_list()
+    l1 = result.count(1)
+    l2 = result.count(2)
+    l1rate = round(l1 / len(result), 3)
+    return (l1, l2, l1rate)
+# Digital Note-------------------------------------------------------------------------------------------------------------------------------------------
+
+# Sharkfin----------------------------------------------------------------------------------------------------------------------------------------
+def sharkfin_process(underlying, start, end, duration, KO, sides):
+    valid_dates = underlying.index.to_list()
+    
+    wholetable = underlying[(underlying.index >= start) & (underlying.index <= end)]
+    def verify(row):
+        day_plus = row.name + relativedelta(months=duration)
+        for j in range(10):
+            if day_plus not in valid_dates:
+                day_plus = day_plus + relativedelta(days=1)
+            else:
+                break
+
+        valid_end_date = day_plus
+        window = underlying[(underlying.index >= row.name) & (underlying.index <= valid_end_date)]
+        if (True in (window['close'] >= row['close']* KO).values) and (sides == 'up' or sides == 'both'):
+            return 1
+        elif (True in (window['close'] <= row['close'] * (1 - KO + 1)).values) and (sides == 'down' or sides == 'both'):
+            return 1
+        else:
+            return 2
+        
+    wholetable['result'] = wholetable.apply(verify, axis = 1)
+    result = wholetable['result'].to_list()
+    ko_result_rate = result.count(1) / len(result)
+    return ko_result_rate
+# Sharkfin----------------------------------------------------------------------------------------------------------------------------------------
+
+
+def digitalnote():
+    start = str(start_box.get())
+    end = str(end_box.get())
+    underlying = str(underlying_box.get())
+    # KI = float(KI_box.get())
+    # KO = float(KO_box.get())
+    duration = int(dur_box.get())
+    strike = float(KI_box.get())/100
+
+    test_start = datetime.strptime(start, '%m/%d/%y')
+    test_end = datetime.strptime(end, '%m/%d/%y')
+    try:
+        underlying_df = get_data(underlying)
+    except:
+        output_label.config(text=f"Data Error")
+
+    result = digitalnote_process(underlying_df, test_start, test_end, duration, strike)
+    
+    
+    output = '''
+    一级收益率: {}.\n二级收益率: {}.\n一级收益率比例: {:.2f}%
+    '''.format(result[0], result[1], result[2]*100)
+    
+    
+    output_label.config(text=f"Result: {output}")
+def sharkfin():
+    start = str(start_box.get())
+    end = str(end_box.get())
+    underlying = str(underlying_box.get())
+    # KI = float(KI_box.get())
+    # KO = float(KO_box.get())
+    duration = int(dur_box.get())
+    KO = float(KO_box.get())/100
+    sides = str(side_option.get())
+    print(sides)
+
+    test_start = datetime.strptime(start, '%m/%d/%y')
+    test_end = datetime.strptime(end, '%m/%d/%y')
+    try:
+        underlying_df = get_data(underlying)
+    except:
+        output_label.config(text=f"Data Error")
+
+    result = sharkfin_process(underlying_df, test_start, test_end, duration, KO, sides) * 100
+    print(result)
+    output = '''
+    敲出率: {:.2f}%.
+    '''.format(result)
+    output_label.config(text=f"Result: {output}")
+
+
+def calculate_snowball_win_rate():
+
+    output_label.config(text=f"计算中...")
+    # force an update of the window to make the new text visible
+    window.update()
+
+    start = str(start_box.get())
+    end = str(end_box.get())
+    underlying = str(underlying_box.get())
+    KI = float(KI_box.get())/100
+    KO = float(KO_box.get())/100
+    duration = int(dur_box.get())
+    lock = int(lock_box.get())
+    stepdown = float(stepdown_box.get())/100
+    recent_prc = 0
+
+    test_start = datetime.strptime(start, '%m/%d/%y')
+    test_end = datetime.strptime(end, '%m/%d/%y')
+    try:
+        underlying_df = get_data(underlying)
+        recent_prc = underlying_df.iloc[-1]['close']
+        print(recent_prc)
+    except:
+        output_label.config(text=f"数据错误")
+
+
+    result = []
+    datelst = []
+    kolst = []
+    kilst = []
+    kolength = []
+    available = underlying_df.index.to_list()
+    available = [x for x in available if x >= test_start and x < test_end]
+    print(test_start)
+    print(test_end)
+    print('available', len(available))
+    i = 0
+    for testdate in available:
+        #if testdate >= test_start and testdate < test_end:
+        target_start = testdate
+        target_end = testdate + relativedelta(months=duration)
+        resultdetail = snowball_process(underlying_df, target_start, target_end, KI, KO, duration, lock, stepdown, kolst, kilst, kolength)
+        i = i + 1
+        try:
+            result.append(resultdetail[0])
+            datelst.append(resultdetail[1])
+        except:
+            print(testdate)
+            pass
+    print(i)
+    print('result', len(result))
+    if result == []:
+        output_label.config(text=f"数据错误")
+        window.update()
+        raise ValueError('Data Out of Range')
+
+    
+    df = pd.DataFrame(datelst)
+    fig, ax = plt.subplots()
+    
+    for d in datelst:
+        if d[1] == 1:
+            ax.axvline(x=d[0], color='b', alpha=0.1, linestyle='--')
+
+    for kiline in kilst:
+        if kiline[0] <= test_end:
+            ax.scatter(x=kiline[0] , y= kiline[1], c='g',s=10)
+    for koline in kolst:
+        if koline[0] <= test_end:
+            ax.scatter(x=koline[0] , y= koline[1], c='r',s=10)
+    
+    ax.axhline(y = recent_prc, color='k', alpha=0.5, linestyle='--')
+    ax.set_xlim(test_start-relativedelta(months=1), test_end+relativedelta(months=1))
+    ax.axhline(y = recent_prc*0.8, color='g', alpha=0.9, linestyle='--')
+    ax.axhline(y = recent_prc*1.03, color='r', alpha=0.9, linestyle='--')
+    #ax.plot(underlying_df[(underlying_df.index >= test_start) & (underlying_df.index <= test_end)])
+    subdf = underlying_df[(underlying_df.index >= test_start) & (underlying_df.index <= test_end)]
+    print(subdf.index[0])
+    ax.plot(subdf)
+    ax.tick_params(axis='x', rotation=30)
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Price')
+    #ax.grid(axis='y', alpha=0.1)
+    ax.set_title('{} Snowball'.format(underlying))
+    img = BytesIO()
+    fig.savefig(img, format='jpg')
+    img.seek(0)
+    plot_data = img.getvalue()
+    img.close
+
+    image_data = base64.b64encode(plot_data).decode('utf-8')
+    decoded_data = base64.b64decode(image_data)
+    image = Image.open(BytesIO(decoded_data))
+    image.show()
+
+
+    output = '''
+    胜率: {:.2f}%    \n敲出率: {:.2f}% \n完结率: {:.2f}%\n平均敲出期限: {:.2f} 个月\n盈利/保本数：{}\n亏损数: {}
+    '''.format(round(win_rate(result),3) * 100, ko_rate(result) * 100,round(finish_rate(result),3) *100, round(np.mean(kolength), 2), win_count(result), result.count(-1))
+    output_label.config(text=f"Result: {output}")
+    plt.show()
+
+def snowballUI():
+    clear_all()
+    print('call snowball')
+
+
+def digitalnoteUI():
+    clear_all()
+    KO_box.insert(0, 'N/A')
+    lock_box.insert(0, 'N/A')
+    stepdown_box.insert(0, 'N/A')
+    print('call digitalnote')
+
+
+def sharkfinUI():
+    clear_all()
+    KI_box.insert(0, 'N/A')
+    lock_box.insert(0, 'N/A')
+    stepdown_box.insert(0, 'N/A')
+    print('call sharkfin')
+
+def select_option(selected):
+    index = options.index(selected)
+    functions[index]()
+
+def select_type(selected):
+    selection = options.index(selected_option.get())
+    
+    selectfunction[selection]()
+
+def clear_all():
+    for widget in window.winfo_children():
+        if isinstance(widget, tk.Entry):
+            widget.delete(0, 'end')
+
+
+# Create a new window
+window = tk.Tk()
+
+# Set the window title
+window.title("期权胜率回测程序")
+window.geometry("400x720")
+
+# drop down menu
+options = ['雪球', '数字票据', '鲨鱼鳍']
+functions = [calculate_snowball_win_rate, digitalnote, sharkfin]
+selectfunction = [snowballUI, digitalnoteUI, sharkfinUI]
+
+selected_option = tk.StringVar(window)
+selected_option.set(options[0])
+dropdown_menu = tk.OptionMenu(window, selected_option, *options, command=select_type)
+menu_label = tk.Label(window, text="结构选择:", font=("Arial", 12))
+menu_label.grid(row=0, column=1, padx=10, pady=10, sticky="W")
+dropdown_menu.grid(row=0, column=2, padx=10, pady=10, sticky="W")
+#dropdown_menu.pack()
+
+# Create the input boxes
+start_label = tk.Label(window, text="起始时间:", font=("Arial", 12))
+#start_box = tk.Entry(window, font=("Arial", 12))
+start_box = DateEntry(window, width=20, background='darkblue', foreground='white', borderwidth=2)
+start_box.grid(row=3, column=2, padx=5, pady=5)
+end_box = DateEntry(window, width=20, background='darkblue', foreground='white', borderwidth=2)
+end_box.grid(row=4, column=2, padx=5, pady=5)
+#start_box.insert(0, '2020/01/01')
+end_label = tk.Label(window, text="结束时间:", font=("Arial", 12))
+#end_box = tk.Entry(window, font=("Arial", 12))
+#end_box.insert(0, '2021/01/01')
+underlying_label = tk.Label(window, text="标的代码BBG:", font=("Arial", 12))
+underlying_box = tk.Entry(window, font=("Arial", 12))
+underlying_box.insert(0, '9988.HK')
+KI_label = tk.Label(window, text="敲入价/行权价:(%)", font=("Arial", 12))
+KI_box = tk.Entry(window, font=("Arial", 12))
+KI_box.insert(0, '75')
+KO_label = tk.Label(window, text="敲出价:(%)", font=("Arial", 12))
+KO_box = tk.Entry(window, font=("Arial", 12))
+KO_box.insert(0, '103')
+dur_label = tk.Label(window, text="期限:", font=("Arial", 12))
+dur_box = tk.Entry(window, font=("Arial", 12))
+dur_box.insert(0, '12')
+lock_label = tk.Label(window, text="锁定期:", font=("Arial", 12))
+lock_box = tk.Entry(window, font=("Arial", 12))
+lock_box.insert(0, '0')
+stepdown_label = tk.Label(window, text="降敲:(%)", font=("Arial", 12))
+stepdown_box = tk.Entry(window, font=("Arial", 12))
+stepdown_box.insert(0, '0')
+sides_label = tk.Label(window, text="鲨鱼鳍敲出方向:", font=("Arial", 12))
+sides_box = tk.Entry(window, font=("Arial", 12))
+
+side_option = tk.StringVar(window)
+side_option.set('both')
+sides_box = tk.OptionMenu(window, side_option, *['both', 'up', 'down'])
+
+# Create the calculate button
+#calculate_button = tk.Button(window, text="点击计算", command=calculate_win_rate)
+calculate_button = tk.Button(window, text="点击计算")
+
+
+# Create the output label
+output_label = tk.Label(window, text="结果: ", font=("Arial", 12))
+
+# Add the widgets to the window button
+KI_label.grid(row=1, column=1, padx=10, pady=10, sticky="W")
+KI_box.grid(row=1, column=2, padx=10, pady=10, ipadx=5, ipady=5)
+KO_label.grid(row=2, column=1, padx=10, pady=10, sticky="W")
+KO_box.grid(row=2, column=2, padx=10, pady=10, ipadx=5, ipady=5)
+start_label.grid(row=3, column=1, padx=10, pady=10, sticky="W")
+#start_box.grid(row=2, column=2, padx=10, pady=10, ipadx=5, ipady=5)
+end_label.grid(row=4, column=1, padx=10, pady=10, sticky="W")
+#end_box.grid(row=3, column=2, padx=10, pady=10, ipadx=5, ipady=5)
+underlying_label.grid(row=5, column=1, padx=10, pady=10, sticky="W")
+underlying_box.grid(row=5, column=2, padx=10, pady=10, ipadx=5, ipady=5)
+dur_label.grid(row=6, column=1, padx=10, pady=10, sticky="W")
+dur_box.grid(row=6, column=2, padx=10, pady=10, ipadx=5, ipady=5)
+lock_label.grid(row=7, column=1, padx=10, pady=10, sticky="W")
+lock_box.grid(row=7, column=2, padx=10, pady=10, ipadx=5, ipady=5)
+stepdown_label.grid(row=8, column=1, padx=10, pady=10, sticky="W")
+stepdown_box.grid(row=8, column=2, padx=10, pady=10, ipadx=5, ipady=5)
+sides_label.grid(row=9, column=1, padx=10, pady=10, sticky="W")
+sides_box.grid(row=9, column=2, padx=10, pady=10, ipadx=5, ipady=5, sticky='W')
+calculate_button.grid(row=10, column=2, columnspan=2, padx=10, pady=10, ipadx=50, ipady=10, sticky='W')
+output_label.grid(row=11, column=2, columnspan=2, padx=10, pady=10, sticky='W')
+
+calculate_button.config(command=lambda: select_option(selected_option.get()))
+
+# Start the main event loop
+window.mainloop()
